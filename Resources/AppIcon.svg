@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#2B1B5E"/>
+      <stop offset="55%" stop-color="#4C2A9C"/>
+      <stop offset="100%" stop-color="#7C3AED"/>
+    </linearGradient>
+    <linearGradient id="screenGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#171335"/>
+      <stop offset="100%" stop-color="#261D52"/>
+    </linearGradient>
+    <radialGradient id="sunGrad" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFEBB0"/>
+      <stop offset="55%" stop-color="#FDBA3D"/>
+      <stop offset="100%" stop-color="#F59E0B"/>
+    </radialGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="45%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <!-- Card is inset within the 1024 canvas (Apple's icon convention) so the
+         corners/edges stay transparent — this is also what lets macOS apply its
+         own soft drop shadow under the icon. rx ≈ 18% of the card's own width. -->
+    <clipPath id="squircle">
+      <rect x="76" y="76" width="872" height="872" rx="160" ry="160"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#squircle)">
+    <rect x="76" y="76" width="872" height="872" fill="url(#bg)"/>
+    <rect x="76" y="76" width="872" height="436" fill="url(#sheen)"/>
+
+    <g>
+      <rect x="182" y="228" width="660" height="440" rx="46" fill="url(#screenGrad)" stroke="#FFFFFF" stroke-opacity="0.88" stroke-width="22"/>
+      <rect x="482" y="668" width="60" height="88" rx="14" fill="#FFFFFF" fill-opacity="0.9"/>
+      <rect x="392" y="748" width="240" height="34" rx="17" fill="#FFFFFF" fill-opacity="0.9"/>
+
+      <g>
+        <circle cx="512" cy="448" r="94" fill="url(#sunGrad)"/>
+        <g stroke="#FDBA3D" stroke-width="26" stroke-linecap="round">
+          <line x1="512" y1="288" x2="512" y2="330"/>
+          <line x1="512" y1="566" x2="512" y2="608"/>
+          <line x1="352" y1="448" x2="394" y2="448"/>
+          <line x1="630" y1="448" x2="672" y2="448"/>
+          <line x1="399" y1="335" x2="428" y2="364"/>
+          <line x1="596" y1="532" x2="625" y2="561"/>
+          <line x1="625" y1="335" x2="596" y2="364"/>
+          <line x1="428" y1="532" x2="399" y2="561"/>
+        </g>
+      </g>
+    </g>
+  </g>
+</svg>
