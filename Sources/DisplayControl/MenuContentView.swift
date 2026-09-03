@@ -65,6 +65,8 @@ struct MenuContentView: View {
       }
       if let loginError { Text(loginError).font(.caption).foregroundStyle(.red) }
 
+      UpdateControlsView()
+
       HStack {
         Text("DisplayControl \(version)")
           .font(.caption2)

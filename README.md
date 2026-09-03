@@ -5,6 +5,20 @@ support. Adjust brightness, contrast, volume, RGB gains, and the monitor's color
 preset. Controls appear only when the monitor returns a valid, plausible value.
 Built for **Apple Silicon**, macOS **13+**, using SwiftUI and Swift Package Manager.
 
+## Install and update
+
+Download the app ZIP from [GitHub Releases](https://github.com/johndavidwright/display-control/releases/latest),
+unzip it, and move DisplayControl.app to Applications. Quit any older copy before
+opening the new one. Versions through 0.2.5 need this manual installation once.
+
+The **Updates** section offers Check for Updates, automatic checks, and optional
+automatic download and installation, using [Sparkle](https://sparkle-project.org/)
+as in F1 Live. Sparkle asks about automatic checks on the second launch unless
+you have already chosen a preference. Automatic installation is opt-in.
+Both the update archive and feed are signed; downloads are verified before
+extraction. Update preferences are stored by Sparkle, separately from monitor
+settings. Updates are disabled for a bare executable launched with swift run.
+
 ## Build and run
 
 Requires Xcode or the Command Line Tools.
@@ -25,6 +39,10 @@ The app runs as a menu-bar agent (`LSUIElement`) without a Dock icon. It uses
 private IOAVService APIs, is unsandboxed, and is ad-hoc signed for personal use.
 It is not notarized. The packaging script verifies the signature before
 replacing the destination bundle.
+
+App metadata and the version live in `Resources/Info.plist`. The packaging
+script embeds Sparkle.framework and its helpers, preserves their signatures,
+and verifies the entire app bundle.
 
 ## Controls and saved values
 
@@ -170,6 +188,38 @@ For a live acceptance check, with only this DDC app running:
 6. Check Launch at Login in System Settings, including the approval-required state.
 7. Expand and collapse Color and Presets, including rapid clicks. Confirm the
    title stays fixed and the panel does not flash or leave an empty section.
+8. Open Updates and check for updates. Verify that Sparkle opens its standard
+   dialog, reports the installed version correctly, and preserves preferences.
+
+## Publishing releases
+
+The Build and Test workflow runs mock-based tests and verifies packaging on
+pushes to main and pull requests. Pushing a `v*` tag runs the release workflow:
+tests, Apple Silicon packaging, EdDSA signing, and GitHub Release publication.
+
+1. Update both version fields in `Resources/Info.plist` to the same new version.
+2. Update `RELEASE_NOTES.md` and commit the changes to main.
+3. Create and push the matching tag (for example, `v0.3.1`).
+4. Confirm Publish Release succeeds before announcing the release.
+
+The release contains an app ZIP, its SHA-256 checksum, and the signed
+`appcast.xml` consumed by installed copies of DisplayControl. The stable feed
+address is the latest GitHub Release's `appcast.xml` asset. Keep the repository
+and release downloads public so app users do not need GitHub credentials.
+
+For a local release build:
+
+```bash
+./scripts/package-release.sh
+./scripts/generate-appcast.sh
+```
+
+Local signing uses the `com.jdw.DisplayControl` account created by Sparkle's
+`generate_keys` tool in the login Keychain. CI uses the encrypted repository
+secret `SPARKLE_PRIVATE_KEY`, passed to the signer through standard input. The
+public counterpart is `SUPublicEDKey` in Info.plist. Keep the private key backed
+up securely and out of Git: replacing it without a supported key migration
+prevents installed copies from accepting future updates.
 
 ## DDC troubleshooting
 
@@ -187,3 +237,6 @@ reboot may be required to recover Apple's display controller.
 IOAVService framing, timing, and IORegistry traversal are adapted from
 [MonitorControl](https://github.com/MonitorControl/MonitorControl) (MIT).
 See `THIRD_PARTY/MonitorControl-LICENSE.txt`.
+
+In-app updates use Sparkle 2.9.6. The packaged app includes both Sparkle's license
+and the MonitorControl license in Contents/Resources.

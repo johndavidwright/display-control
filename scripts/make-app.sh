@@ -11,46 +11,29 @@ case "$APP" in
   /*.app) ;;
   *) echo "Destination must be an absolute path ending in .app" >&2; exit 2 ;;
 esac
-BUNDLE_ID="com.jdw.DisplayControl"
-VERSION="0.2.5"
-
 echo "→ Building ($CONFIG)…"
-swift build -c "$CONFIG"
-BIN="$(swift build -c "$CONFIG" --show-bin-path)/DisplayControl"
+swift build -c "$CONFIG" --arch arm64
+BIN_DIR="$(swift build -c "$CONFIG" --arch arm64 --show-bin-path)"
+BIN="$BIN_DIR/DisplayControl"
 
 echo "→ Assembling ${APP}…"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 STAGED_APP="$WORK/DisplayControl.app"
-mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources"
+mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources" "$STAGED_APP/Contents/Frameworks"
 cp "$BIN" "$STAGED_APP/Contents/MacOS/DisplayControl"
+cp "$ROOT/Resources/Info.plist" "$STAGED_APP/Contents/Info.plist"
+ditto "$BIN_DIR/Sparkle.framework" "$STAGED_APP/Contents/Frameworks/Sparkle.framework"
+cp "$ROOT/.build/checkouts/Sparkle/LICENSE" "$STAGED_APP/Contents/Resources/Sparkle-LICENSE.txt"
+cp "$ROOT/THIRD_PARTY/MonitorControl-LICENSE.txt" "$STAGED_APP/Contents/Resources/MonitorControl-LICENSE.txt"
 if [ -f "$ROOT/Resources/AppIcon.icns" ]; then
   cp "$ROOT/Resources/AppIcon.icns" "$STAGED_APP/Contents/Resources/AppIcon.icns"
 fi
 
-cat > "$STAGED_APP/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key>            <string>DisplayControl</string>
-  <key>CFBundleDisplayName</key>     <string>Display Control</string>
-  <key>CFBundleIdentifier</key>      <string>$BUNDLE_ID</string>
-  <key>CFBundleExecutable</key>      <string>DisplayControl</string>
-  <key>CFBundleIconFile</key>        <string>AppIcon</string>
-  <key>CFBundlePackageType</key>     <string>APPL</string>
-  <key>CFBundleShortVersionString</key> <string>$VERSION</string>
-  <key>CFBundleVersion</key>         <string>$VERSION</string>
-  <key>LSMinimumSystemVersion</key>  <string>13.0</string>
-  <key>LSUIElement</key>             <true/>
-  <key>NSHighResolutionCapable</key> <true/>
-</dict>
-</plist>
-PLIST
-
 echo "→ Ad-hoc code signing…"
 codesign --force --sign - "$STAGED_APP"
-codesign --verify --strict "$STAGED_APP"
+codesign --verify --deep --strict "$STAGED_APP"
+lipo "$STAGED_APP/Contents/MacOS/DisplayControl" -verify_arch arm64
 mkdir -p "$(dirname "$APP")"
 rm -rf "$APP"
 mv "$STAGED_APP" "$APP"

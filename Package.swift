@@ -9,6 +9,9 @@ let package = Package(
     .executable(name: "ddc-diagnose", targets: ["Diagnose"]),
     .library(name: "DDCKit", targets: ["DDCKit"]),
   ],
+  dependencies: [
+    .package(url: "https://github.com/sparkle-project/Sparkle", exact: "2.9.6"),
+  ],
   targets: [
     // Declarations for private IOAVService / CoreDisplay symbols.
     .target(name: "CDDCPrivate"),
@@ -21,7 +24,13 @@ let package = Package(
     ]),
     .target(name: "DiagnoseSupport"),
     .testTarget(name: "DDCKitTests", dependencies: ["DDCKit", "DiagnoseSupport"]),
-    .executableTarget(name: "DisplayControl", dependencies: ["DDCKit"]),
+    .executableTarget(
+      name: "DisplayControl",
+      dependencies: ["DDCKit", .product(name: "Sparkle", package: "Sparkle")],
+      linkerSettings: [
+        .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks"]),
+      ]
+    ),
     // Default diagnostics are read-only; explicit subcommands can write.
     .executableTarget(name: "Diagnose", dependencies: ["DDCKit", "DiagnoseSupport"]),
   ]

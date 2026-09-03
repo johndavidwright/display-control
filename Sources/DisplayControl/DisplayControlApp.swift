@@ -15,12 +15,14 @@ struct DisplayControlApp: App {
   @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
   @StateObject private var manager = DisplayManager()
   @StateObject private var presetStore = PresetStore()
+  @StateObject private var updates = UpdateController()
 
   var body: some Scene {
     MenuBarExtra("DisplayControl", systemImage: "sun.max.circle") {
       MenuContentView()
         .environmentObject(manager)
         .environmentObject(presetStore)
+        .environmentObject(updates)
     }
     .menuBarExtraStyle(.window)
   }

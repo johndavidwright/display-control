@@ -1,0 +1,47 @@
+name: Publish Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify tag and version
+        run: |
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)
+          build=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist)
+          test "v$version" = "$GITHUB_REF_NAME"
+          test "$build" = "$version"
+      - name: Test without monitor access
+        run: swift test
+      - name: Package Apple Silicon app
+        run: ./scripts/package-release.sh
+      - name: Sign update archive and feed
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          test -n "$SPARKLE_PRIVATE_KEY"
+          ./scripts/generate-appcast.sh
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/DisplayControl-$version-macOS-arm64.zip" \
+            "dist/DisplayControl-$version-macOS-arm64.zip.sha256" \
+            "dist/appcast.xml" \
+            --verify-tag --title "DisplayControl $version" \
+            --notes-file RELEASE_NOTES.md

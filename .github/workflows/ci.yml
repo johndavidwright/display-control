@@ -1,0 +1,19 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test without monitor access
+        run: swift test
+      - name: Verify packaged app
+        run: ./scripts/make-app.sh release "$RUNNER_TEMP/DisplayControl.app"
