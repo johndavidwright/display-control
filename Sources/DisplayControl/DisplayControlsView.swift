@@ -19,6 +19,12 @@ struct DisplayControlsView: View {
       }
 
       DisplayPresetsView(display: display)
+      if display.isBusy {
+        Text(display.isProbing ? "Reading controls…" : "Applying changes…")
+          .font(.caption2).foregroundStyle(.secondary)
+      }
+      if let error = display.lastError { Text(error).font(.caption).foregroundStyle(.red) }
+      if let message = display.statusMessage { Text(message).font(.caption).foregroundStyle(.secondary) }
     }
   }
 
@@ -44,6 +50,9 @@ struct FeatureSlider: View {
         .frame(width: 16)
         .foregroundStyle(.secondary)
       Slider(value: binding, in: 0 ... Double(feature.max))
+        .accessibilityLabel(feature.code.name)
+        .help(feature.code.name)
+        .disabled(display.isProbing || display.isResetting)
       Text("\(Int(binding.wrappedValue))")
         .font(.caption).monospacedDigit()
         .frame(width: 30, alignment: .trailing)

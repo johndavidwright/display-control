@@ -13,28 +13,16 @@ let package = Package(
     // Declarations for private IOAVService / CoreDisplay symbols.
     .target(name: "CDDCPrivate"),
     // DDC/CI engine + display model (UI-agnostic).
-    .target(name: "DDCKit", dependencies: ["CDDCPrivate"]),
-    // Menu bar app.
-    .executableTarget(
-      name: "DisplayControl",
-      dependencies: ["DDCKit"],
-      linkerSettings: [
-        .linkedFramework("IOKit"),
-        .linkedFramework("CoreGraphics"),
-        // IOAVService*/CoreDisplay_* live in the dyld shared cache but aren't in
-        // the SDK stubs, so resolve them at runtime.
-        .unsafeFlags(["-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"]),
-      ]
-    ),
-    // Headless DDC diagnostics (read-only): list displays + detected features.
-    .executableTarget(
-      name: "Diagnose",
-      dependencies: ["DDCKit"],
-      linkerSettings: [
-        .linkedFramework("IOKit"),
-        .linkedFramework("CoreGraphics"),
-        .unsafeFlags(["-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"]),
-      ]
-    ),
+    .target(name: "DDCKit", dependencies: ["CDDCPrivate"], linkerSettings: [
+      .linkedFramework("IOKit"),
+      .linkedFramework("CoreGraphics"),
+      // Private IOAVService/CoreDisplay symbols resolve from the dyld cache.
+      .unsafeFlags(["-Xlinker", "-undefined", "-Xlinker", "dynamic_lookup"]),
+    ]),
+    .target(name: "DiagnoseSupport"),
+    .testTarget(name: "DDCKitTests", dependencies: ["DDCKit", "DiagnoseSupport"]),
+    .executableTarget(name: "DisplayControl", dependencies: ["DDCKit"]),
+    // Default diagnostics are read-only; explicit subcommands can write.
+    .executableTarget(name: "Diagnose", dependencies: ["DDCKit", "DiagnoseSupport"]),
   ]
 )

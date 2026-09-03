@@ -4,105 +4,142 @@ import CoreGraphics
 import Foundation
 import CDDCPrivate
 
-/// Enumerates displays, matches each to its IOAVService, and refreshes on
-/// display reconfiguration and system wake.
+struct DisplayDescriptor {
+  let id: CGDirectDisplayID
+  let name: String
+  let identityKey: String
+  let isBuiltin: Bool
+  let transport: DDCTransport?
+  let connectionKey: String
+
+  init(id: CGDirectDisplayID, name: String, identityKey: String, isBuiltin: Bool,
+       transport: DDCTransport?, connectionKey: String? = nil) {
+    self.id = id
+    self.name = name
+    self.identityKey = identityKey
+    self.isBuiltin = isBuiltin
+    self.transport = transport
+    self.connectionKey = connectionKey ?? identityKey
+  }
+}
+
+/// Main-thread enumeration and observable state; per-display I/O stays off main.
 public final class DisplayManager: ObservableObject {
   @Published public private(set) var displays: [Display] = []
-
-  private let settingsStore: SettingsStore?
+  public let settingsStore: SettingsStore?
+  private let discover: () -> [DisplayDescriptor]
+  // Retain sessions across disconnects, including any syscall still in progress.
+  private var knownDisplays: [String: Display] = [:]
+  private var subscriptions: [AnyCancellable] = []
+  private var wakeObserver: NSObjectProtocol?
+  private var refreshWork: DispatchWorkItem?
   private var reconfigRegistered = false
 
-  /// `autoRestore: false` disables persistence entirely (no restore-on-launch,
-  /// no writes are saved) — used by diagnostic/test tools so they stay
-  /// side-effect-free against the real app's saved settings and hardware.
-  public init(autoRestore: Bool = true) {
-    self.settingsStore = autoRestore ? SettingsStore() : nil
-    self.refresh()
-    self.registerCallbacks()
+  public convenience init(autoRestore: Bool = true) {
+    self.init(settingsStore: autoRestore ? SettingsStore() : nil,
+              discover: Self.discoverDisplays, observeSystem: true)
   }
 
-  /// Displays that actually expose DDC controls.
+  init(settingsStore: SettingsStore?, discover: @escaping () -> [DisplayDescriptor], observeSystem: Bool = false) {
+    self.settingsStore = settingsStore
+    self.discover = discover
+    refresh()
+    if observeSystem { registerCallbacks() }
+  }
+
+  deinit {
+    refreshWork?.cancel()
+    if reconfigRegistered {
+      CGDisplayRemoveReconfigurationCallback(Self.reconfigurationCallback, Unmanaged.passUnretained(self).toOpaque())
+    }
+    if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
+  }
+
   public var controllable: [Display] { displays.filter { $0.supportsDDC } }
+  public var isBusy: Bool { displays.contains { $0.isBusy } }
 
   public func refresh() {
-    // CoreGraphics display info + service matching must run on the main thread:
-    // called cold on a background thread, CGDisplay*Number can return 0 (a race
-    // that makes every match score 0). The slow part — per-display DDC reads — is
-    // offloaded per Display below.
-    if !Thread.isMainThread {
+    guard Thread.isMainThread else {
       DispatchQueue.main.async { [weak self] in self?.refresh() }
       return
     }
-
-    let ids = Self.onlineDisplays()
-    let matches = Arm64DDC.getServiceMatches(displayIDs: ids)
-    let existing = self.displays
-
+    refreshWork?.cancel()
+    refreshWork = nil
+    let descriptors = discover()
+    let present = Set(descriptors.map(\.connectionKey))
+    for (key, display) in knownDisplays where !present.contains(key) { display.disconnect() }
     var result: [Display] = []
-    var toProbe: [Display] = []
-    for id in ids {
-      let builtin = CGDisplayIsBuiltin(id) != 0
-      let match = matches.first { $0.displayID == id }
-      let key = Self.identityKey(for: id, match: match)
-      // Reuse an existing Display (and its writer/state) when identity matches.
-      if let reused = existing.first(where: { $0.identityKey == key && $0.id == id }) {
-        result.append(reused)
+    for descriptor in descriptors {
+      let display: Display
+      if let existing = knownDisplays[descriptor.connectionKey] {
+        display = existing
+        display.reconnect(id: descriptor.id, name: descriptor.name, transport: descriptor.transport)
       } else {
-        let display = Display(id: id,
-                              name: Self.displayName(id),
-                              identityKey: key,
-                              isBuiltin: builtin,
-                              service: builtin ? nil : match?.service,
-                              settingsStore: settingsStore)
-        result.append(display)
-        toProbe.append(display)
+        display = Display(id: descriptor.id, name: descriptor.name, identityKey: descriptor.identityKey,
+                          isBuiltin: descriptor.isBuiltin, transport: descriptor.transport, settingsStore: settingsStore)
+        knownDisplays[descriptor.connectionKey] = display
+        display.probe()
       }
+      result.append(display)
     }
-    self.displays = result
-
-    // Detect features; probe() runs on each display's serial session queue,
-    // publishes its own features when done, and applies saved settings once
-    // features are known. For displays we're reusing, features are already
-    // known — re-apply saved settings now. This is what restores a monitor's
-    // brightness/color after IT power-cycles (e.g. on wake) even though macOS
-    // never dropped it from the online display list, so no new Display was
-    // created above.
-    for display in result where !toProbe.contains(where: { $0 === display }) {
-      display.applySavedSettings()
+    subscriptions = result.map { display in
+      // Published sends before mutation; deliver on the next main-queue turn so
+      // computed lists see the updated child state, including initial probing.
+      display.objectWillChange.receive(on: DispatchQueue.main).sink { [weak self] _ in self?.objectWillChange.send() }
     }
-    for display in toProbe where display.service != nil {
-      display.probe()
+    if let settingsStore {
+      subscriptions.append(settingsStore.objectWillChange.receive(on: DispatchQueue.main).sink { [weak self] _ in
+        self?.objectWillChange.send()
+      })
     }
+    displays = result
   }
 
-  // MARK: - System callbacks
+  func scheduleRefresh(after delay: TimeInterval) {
+    refreshWork?.cancel()
+    let work = DispatchWorkItem { [weak self] in self?.refresh() }
+    refreshWork = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+  }
+
+  private static let reconfigurationCallback: CGDisplayReconfigurationCallBack = { _, flags, context in
+    guard !flags.contains(.beginConfigurationFlag), let context else { return }
+    let manager = Unmanaged<DisplayManager>.fromOpaque(context).takeUnretainedValue()
+    DispatchQueue.main.async { [weak manager] in manager?.scheduleRefresh(after: 0.5) }
+  }
 
   private func registerCallbacks() {
-    guard !reconfigRegistered else { return }
-    reconfigRegistered = true
-    let ctx = Unmanaged.passUnretained(self).toOpaque()
-    CGDisplayRegisterReconfigurationCallback({ _, _, userInfo in
-      guard let userInfo else { return }
-      let mgr = Unmanaged<DisplayManager>.fromOpaque(userInfo).takeUnretainedValue()
-      // Coalesce the burst of callbacks a reconfiguration produces.
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { mgr.refresh() }
-    }, ctx)
-
-    NSWorkspace.shared.notificationCenter.addObserver(
+    reconfigRegistered = CGDisplayRegisterReconfigurationCallback(
+      Self.reconfigurationCallback, Unmanaged.passUnretained(self).toOpaque()) == .success
+    wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
       forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
-    ) { [weak self] _ in
-      // Monitors often reset DDC state on power cycle; re-probe after wake.
-      DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.refresh() }
-    }
+    ) { [weak self] _ in self?.scheduleRefresh(after: 1.5) }
   }
 
-  // MARK: - Helpers
+  private static func discoverDisplays() -> [DisplayDescriptor] {
+    let ids = onlineDisplays()
+    let matches = Arm64DDC.getServiceMatches(displayIDs: ids)
+    return ids.map { id in
+      let match = matches.first { $0.displayID == id }
+      let builtin = CGDisplayIsBuiltin(id) != 0
+      let key = identityKey(for: id, match: match)
+      let location = match?.details.ioDisplayLocation ?? ""
+      // Keep connection/session identity separate from the existing on-disk
+      // identity format. Duplicate EDIDs must not share one live Display.
+      let connection = key + "@" + (location.isEmpty ? String(id) : location)
+      let transport = builtin ? nil : match?.service.map {
+        DisplayDDCTransport(base: PacketDDCTransport(io: IOAVI2C(service: $0)), identityKey: key)
+      }
+      return DisplayDescriptor(id: id, name: displayName(id), identityKey: key,
+                               isBuiltin: builtin, transport: transport, connectionKey: connection)
+    }
+  }
 
   static func onlineDisplays() -> [CGDirectDisplayID] {
     var count: UInt32 = 0
-    CGGetOnlineDisplayList(0, nil, &count)
+    guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
     var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
-    CGGetOnlineDisplayList(count, &ids, &count)
+    guard CGGetOnlineDisplayList(count, &ids, &count) == .success else { return [] }
     return Array(ids.prefix(Int(count)))
   }
 
@@ -119,20 +156,15 @@ public final class DisplayManager: ObservableObject {
     return "\(CGDisplayVendorNumber(id))-\(CGDisplayModelNumber(id))-\(CGDisplaySerialNumber(id))"
   }
 
-  /// Debug helper: run enumeration + matching synchronously and describe it.
+  /// Read-only matching details. Call from the main thread, like refresh().
   public static func debugDump() -> String {
     let ids = onlineDisplays()
-    var out = "displayIDs: \(ids)\n"
-    let services = Arm64DDC.getIoregServicesForMatching()
-    out += "ioreg services: \(services.count)\n"
-    for s in services {
-      out += "  loc=\(s.serviceLocation) location='\(s.location)' edid=\(s.edidUUID.prefix(12)) serial=\(s.serialNumber) name='\(s.productName)' service=\(s.service != nil)\n"
-    }
     let matches = Arm64DDC.getServiceMatches(displayIDs: ids)
-    out += "matches: \(matches.count)\n"
-    for m in matches {
-      out += "  id=\(m.displayID) score=\(m.matchScore) service=\(m.service != nil) edid=\(m.details.edidUUID.prefix(12))\n"
+    var output = "displayIDs: \(ids)\nmatches: \(matches.count)\n"
+    for match in matches {
+      output += "  id=\(match.displayID) score=\(match.matchScore) service=\(match.service != nil) edid=\(match.details.edidUUID.prefix(12))\n"
     }
-    return out
+    return output
   }
+
 }

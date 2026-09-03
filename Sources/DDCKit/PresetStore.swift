@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 /// A named, user-owned snapshot of ONE display's values — e.g. "sRGB
@@ -24,6 +25,8 @@ public struct DisplayPreset: Codable, Identifiable {
 public final class PresetStore: ObservableObject {
   /// identityKey -> that display's presets, in save order.
   @Published private var byDisplay: [String: [DisplayPreset]] = [:]
+  @Published public private(set) var lastError: String?
+  private var loadFailed = false
   private let url: URL
 
   /// `directory` overrides where `presets.json` lives — used by tests/diagnostics
@@ -35,42 +38,57 @@ public final class PresetStore: ObservableObject {
         ?? FileManager.default.temporaryDirectory
       return base.appendingPathComponent("DisplayControl", isDirectory: true)
     }()
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     self.url = dir.appendingPathComponent("presets.json")
-    self.load()
+    do {
+      try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+      if FileManager.default.fileExists(atPath: url.path) {
+        byDisplay = try JSONDecoder().decode([String: [DisplayPreset]].self, from: Data(contentsOf: url))
+      }
+    } catch {
+      loadFailed = true
+      lastError = "Presets could not be loaded. The existing file was left unchanged. \(error.localizedDescription)"
+    }
   }
 
   public func presets(for identityKey: String) -> [DisplayPreset] {
     byDisplay[identityKey] ?? []
   }
 
-  /// Snapshot a display's live current values into a new named preset.
-  public func save(name: String, for display: Display) {
-    var values: [String: UInt16] = [:]
-    for f in display.features.values { values[String(f.code.code)] = f.current }
-    byDisplay[display.identityKey, default: []].append(DisplayPreset(name: name, values: values))
-    persist()
+  /// Save only settled, confirmed values, and publish only after disk succeeds.
+  @discardableResult
+  public func save(name: String, for display: Display) -> Bool {
+    let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty, display.supportsDDC, !display.isBusy else {
+      lastError = "Wait for the monitor to finish updating, then save a named preset."
+      return false
+    }
+    var next = byDisplay
+    next[display.identityKey, default: []].append(DisplayPreset(name: trimmed, values: display.confirmedSnapshot))
+    return persist(next)
   }
 
-  public func delete(_ preset: DisplayPreset, for identityKey: String) {
-    byDisplay[identityKey]?.removeAll { $0.id == preset.id }
-    persist()
+  @discardableResult
+  public func delete(_ preset: DisplayPreset, for identityKey: String) -> Bool {
+    var next = byDisplay
+    next[identityKey]?.removeAll { $0.id == preset.id }
+    return persist(next)
   }
 
-  /// Apply a preset to the display it was scoped to. Values are clamped to the
-  /// display's own reported max per feature (see Display.apply).
   public func apply(_ preset: DisplayPreset, to display: Display) {
     display.apply(preset.values)
   }
 
-  private func load() {
-    guard let data = try? Data(contentsOf: url),
-          let decoded = try? JSONDecoder().decode([String: [DisplayPreset]].self, from: data) else { return }
-    byDisplay = decoded
-  }
-
-  private func persist() {
-    guard let data = try? JSONEncoder().encode(byDisplay) else { return }
-    try? data.write(to: url, options: .atomic)
+  private func persist(_ next: [String: [DisplayPreset]]) -> Bool {
+    guard !loadFailed else { return false }
+    do {
+      let data = try JSONEncoder().encode(next)
+      try data.write(to: url, options: .atomic)
+      byDisplay = next
+      lastError = nil
+      return true
+    } catch {
+      lastError = "Presets could not be saved. \(error.localizedDescription)"
+      return false
+    }
   }
 }

@@ -1,137 +1,244 @@
 import Combine
 import CoreGraphics
 import Foundation
-import CDDCPrivate
 
-/// One external display and its DDC-controllable features.
+/// UI state is confined to the main thread; hardware work belongs to DDCSession.
 public final class Display: ObservableObject, Identifiable {
-  public let id: CGDirectDisplayID
-  public let name: String
-  /// Stable identity (EDID UUID when available) for persistence across reconnects.
+  public private(set) var id: CGDirectDisplayID
+  public private(set) var name: String
   public let identityKey: String
   public let isBuiltin: Bool
-
-  let service: IOAVService?
-  private let session: DDCSession?
+  private let session: DDCSession
   private let settingsStore: SettingsStore?
+  private let resetDelay: UInt32
+  private var epoch = UUID()
+  private var requests: [UInt8: UUID] = [:]
+  private var confirmed: [UInt8: UInt16] = [:]
+  private var refreshRequested = false
+  private var colorReadbackNeeded = false
+  private var persistColorReadback = false
 
   @Published public private(set) var features: [UInt8: Feature] = [:]
+  @Published public private(set) var isAvailable: Bool
+  @Published public private(set) var isProbing = false
+  @Published public private(set) var isResetting = false
+  @Published public private(set) var pendingCodes: Set<UInt8> = []
+  @Published public private(set) var lastError: String?
+  @Published public private(set) var statusMessage: String?
 
-  public var supportsDDC: Bool { service != nil && !features.isEmpty }
+  public var isBusy: Bool { isProbing || isResetting || !pendingCodes.isEmpty }
+  public var supportsDDC: Bool { isAvailable && !features.isEmpty }
   public var colorFeatures: [Feature] {
-    features.values.filter { $0.code.isColor }.sorted { $0.code.code < $1.code.code }
+    features.values.filter { $0.code.isColor }.sorted { $0.id < $1.id }
   }
   public var mainFeatures: [Feature] {
-    features.values.filter { !$0.code.isColor }.sorted { $0.code.code < $1.code.code }
+    features.values.filter { !$0.code.isColor }.sorted { $0.id < $1.id }
+  }
+  public var confirmedSnapshot: [String: UInt16] {
+    Dictionary(uniqueKeysWithValues: confirmed.map { (String($0.key), $0.value) })
   }
 
-  init(id: CGDirectDisplayID, name: String, identityKey: String, isBuiltin: Bool, service: IOAVService?, settingsStore: SettingsStore? = nil) {
+  init(id: CGDirectDisplayID, name: String, identityKey: String, isBuiltin: Bool,
+       transport: DDCTransport?, settingsStore: SettingsStore? = nil,
+       session: DDCSession? = nil, resetDelay: UInt32 = 1_200_000) {
     self.id = id
     self.name = name
     self.identityKey = identityKey
     self.isBuiltin = isBuiltin
-    self.service = service
-    self.session = service != nil ? DDCSession(service: service) : nil
+    self.isAvailable = transport != nil
+    self.session = session ?? DDCSession(transport: transport)
     self.settingsStore = settingsStore
+    self.resetDelay = resetDelay
   }
 
-  /// Detect supported features by attempting a read of each catalog code, on the
-  /// serial session queue. Values with an implausible max (e.g. a monitor
-  /// returning 0xFFFF for an unsupported control) are rejected.
-  public func probe() {
-    guard let session else { return }
-    session.perform { [weak self] s in
-      guard let self else { return }
+  func reconnect(id: CGDirectDisplayID, name: String, transport: DDCTransport?) {
+    self.id = id
+    self.name = name
+    session.replaceTransport(transport)
+    isAvailable = transport != nil
+    if isAvailable { probe() } else { disconnect() }
+  }
+
+  func disconnect() {
+    epoch = UUID()
+    requests.removeAll()
+    session.cancelPendingWrites()
+    session.replaceTransport(nil)
+    isAvailable = false
+    isProbing = false
+    isResetting = false
+    pendingCodes = []
+    features = [:]
+    confirmed = [:]
+    refreshRequested = false
+    colorReadbackNeeded = false
+  }
+
+  /// Retry detection even for existing displays. Defer refresh while the user is
+  /// adjusting controls so an older read cannot replace a newer slider value.
+  public func probe(restoreSavedSettings: Bool = true) {
+    guard isAvailable else { return }
+    guard !isBusy else { refreshRequested = true; return }
+    isProbing = true
+    lastError = nil
+    let generation = epoch
+    session.perform { s in
       var found: [UInt8: Feature] = [:]
       for vcp in VCPCode.catalog {
-        guard let r = s.read(vcp.code) else { continue }
-        guard r.max >= 1, r.max <= 255 else { continue }
-        found[vcp.code] = Feature(code: vcp, current: min(r.current, r.max), max: r.max)
+        guard let r = s.read(vcp.code), r.max >= 1, r.max <= 255, r.current <= r.max else { continue }
+        found[vcp.code] = Feature(code: vcp, current: r.current, max: r.max)
       }
-      DispatchQueue.main.async {
+      DispatchQueue.main.async { [weak self] in
+        guard let self, self.epoch == generation else { return }
         self.features = found
-        // First time we see this display's features (e.g. at launch or after a
-        // true reconnect) — bring it to its last-known settings.
-        self.applySavedSettings()
+        self.confirmed = found.mapValues(\.current)
+        self.isProbing = false
+        if found.isEmpty { self.lastError = "The monitor did not expose any controls. Try Refresh." }
+        if restoreSavedSettings { self.applySavedSettings(skipConfirmedMatches: true) }
+        self.finishWork()
       }
     }
   }
 
-  /// Optimistically update local state, enqueue the DDC write, and persist.
+  /// Optimistic sliders settle to verified readbacks. Only confirmed writes are
+  /// persisted; a failed command rolls back and leaves a visible error.
   public func set(_ code: UInt8, _ value: UInt16) {
-    if var f = features[code] {
-      f.current = min(value, f.max)
-      features[code] = f
+    setValue(code, value, persistRelatedColors: true)
+  }
+
+  private func setValue(_ code: UInt8, _ value: UInt16, persistRelatedColors: Bool) {
+    guard isAvailable, !isProbing, !isResetting, var feature = features[code] else {
+      lastError = "This control is unavailable or the monitor is busy."
+      return
     }
-    session?.write(code, value)
-    settingsStore?.update(identityKey: identityKey, code: code, value: value)
+    if pendingCodes.isEmpty { lastError = nil; statusMessage = nil }
+    let requested = min(value, feature.max)
+    let token = UUID()
+    let generation = epoch
+    requests[code] = token
+    pendingCodes.insert(code)
+    feature.current = requested
+    features[code] = feature
+    session.write(code, requested) { [weak self] result in
+      DispatchQueue.main.async {
+        guard let self, self.epoch == generation, self.requests[code] == token else { return }
+        self.requests.removeValue(forKey: code)
+        self.pendingCodes.remove(code)
+        switch result {
+        case .confirmed(let actual):
+          self.adopt(code, actual.current, persist: true)
+          if code == 0x14 {
+            self.colorReadbackNeeded = true
+            self.persistColorReadback = persistRelatedColors
+          }
+        case .failed(let actual):
+          self.adopt(code, actual?.current ?? self.confirmed[code] ?? feature.current, persist: false)
+          if let actual {
+            self.lastError = "Could not set \(feature.code.name) to \(requested): the monitor reported \(actual.current)."
+          } else {
+            self.lastError = "Could not verify \(feature.code.name) at \(requested): the monitor did not return a valid readback. Try Refresh."
+          }
+        case .superseded:
+          break
+        }
+        self.finishWork()
+      }
+    }
   }
 
-  /// Re-apply last-known values for every currently supported feature. Safe to
-  /// call any time (e.g. on every DisplayManager refresh) — a monitor that has
-  /// no saved settings yet, or already matches them, is a no-op per feature.
-  public func applySavedSettings() {
+  public func applySavedSettings() { applySavedSettings(skipConfirmedMatches: false) }
+
+  private func applySavedSettings(skipConfirmedMatches: Bool) {
     guard let saved = settingsStore?.settings(for: identityKey) else { return }
-    apply(saved.values)
+    apply(saved.values, skipConfirmedMatches: skipConfirmedMatches)
   }
 
-  /// Apply a snapshot of values (e.g. a user-defined preset) to every currently
-  /// supported feature the snapshot has a value for. Values are clamped to this
-  /// display's own reported max, so a snapshot taken on a different-scale
-  /// monitor (e.g. 0–255 gain vs. 0–100) degrades gracefully instead of
-  /// overshooting. Goes through the normal set() path, so it's persisted as the
-  /// new last-known state too.
-  public func apply(_ values: [String: UInt16]) {
-    for feature in features.values {
-      guard let value = values[String(feature.code.code)] else { continue }
-      set(feature.code.code, min(value, feature.max))
+  public func apply(_ values: [String: UInt16]) { apply(values, skipConfirmedMatches: false) }
+
+  private func apply(_ values: [String: UInt16], skipConfirmedMatches: Bool) {
+    // Re-selecting an already active color slot can reset its gains. After a
+    // fresh probe, restore only differences. A slot change invalidates the old
+    // gain readbacks, so every value in that snapshot must still be restored.
+    let changesColorSlot = values["20"].flatMap { requested in
+      features[0x14].map { min(requested, $0.max) != confirmed[0x14] || pendingCodes.contains(0x14) }
+    } ?? false
+    let codes = features.keys.sorted { ($0 == 0x14 ? -1 : Int($0)) < ($1 == 0x14 ? -1 : Int($1)) }
+    for code in codes {
+      guard let value = values[String(code)], let feature = features[code] else { continue }
+      let requested = min(value, feature.max)
+      if skipConfirmedMatches, !changesColorSlot, !pendingCodes.contains(code), confirmed[code] == requested { continue }
+      setValue(code, requested, persistRelatedColors: false)
     }
   }
 
   public func value(for code: UInt8) -> UInt16 { features[code]?.current ?? 0 }
   public func maxValue(for code: UInt8) -> UInt16 { features[code]?.max ?? 100 }
 
-  /// Reset color. Tries the monitor's own factory-color reset (VCP 0x08); if the
-  /// gains actually move, adopt the reported factory values. If the monitor
-  /// ignores 0x08 (some do), fall back to a deterministic neutral white balance
-  /// (every RGB gain at max = equal channels = no color cast). Either way the
-  /// sliders end up reflecting the real state.
+  /// An unchanged readback can mean the monitor was already at factory defaults.
+  /// Never infer failure from that alone or substitute maximum RGB gains.
   public func resetColor() {
-    guard let session else { return }
-    let gainCodes = [UInt8(0x16), 0x18, 0x1A].filter { features[$0] != nil }
-    let colorCodes = features.values.filter { $0.code.isColor }.map { $0.code.code }
-    guard !gainCodes.isEmpty else { return }
-    let before = gainCodes.reduce(into: [UInt8: UInt16]()) { $0[$1] = features[$1]?.current ?? 0 }
-
-    // Runs on the serial session queue → never overlaps slider writes/probes.
-    session.perform { [weak self] s in
-      guard let self else { return }
-      s.writeOnce(VCPCode.restoreColorDefaults, 1)
-      usleep(1_200_000) // give the monitor time to apply the reset
-
-      var readback: [UInt8: UInt16] = [:]
-      for code in colorCodes {
-        if let r = s.read(code) { readback[code] = r.current }
+    guard isAvailable, !isBusy, !colorFeatures.isEmpty else { return }
+    let codes = colorFeatures.map(\.id)
+    let before = confirmed
+    let generation = epoch
+    isResetting = true
+    lastError = nil
+    statusMessage = nil
+    session.perform { s in
+      let sent = s.writeOnce(VCPCode.restoreColorDefaults, 1)
+      if sent { usleep(self.resetDelay) }
+      let readback = Self.readColors(codes, session: s)
+      DispatchQueue.main.async { [weak self] in
+        guard let self, self.epoch == generation else { return }
+        for (code, value) in readback { self.adopt(code, value, persist: sent) }
+        if !sent || readback.count != codes.count {
+          self.lastError = "Could not confirm the color reset. Try Refresh."
+        } else if codes.allSatisfy({ readback[$0] == before[$0] }) {
+          self.statusMessage = "Color values are unchanged. The monitor may already be at its defaults or may not support reset."
+        }
+        self.isResetting = false
+        self.finishWork()
       }
-      let honored = gainCodes.contains { readback[$0] != nil && readback[$0] != before[$0] }
+    }
+  }
 
-      DispatchQueue.main.async {
-        if honored {
-          // Adopt whatever the monitor reports post-reset.
-          for code in colorCodes {
-            guard let v = readback[code], var f = self.features[code] else { continue }
-            f.current = min(v, f.max)
-            self.features[code] = f
-            self.settingsStore?.update(identityKey: self.identityKey, code: code, value: f.current)
-          }
-        } else {
-          // Monitor ignores 0x08 → neutral white balance via the normal write path.
-          for code in gainCodes {
-            guard let f = self.features[code] else { continue }
-            self.set(code, f.max)
-          }
+  private static func readColors(_ codes: [UInt8], session: DDCSession) -> [UInt8: UInt16] {
+    var values: [UInt8: UInt16] = [:]
+    for code in codes {
+      if let r = session.read(code), r.max >= 1, r.max <= 255, r.current <= r.max { values[code] = r.current }
+    }
+    return values
+  }
+
+  private func adopt(_ code: UInt8, _ value: UInt16, persist: Bool) {
+    guard var feature = features[code] else { return }
+    feature.current = min(value, feature.max)
+    features[code] = feature
+    confirmed[code] = feature.current
+    if persist { settingsStore?.update(identityKey: identityKey, code: code, value: feature.current) }
+  }
+
+  private func finishWork() {
+    guard !isBusy else { return }
+    if colorReadbackNeeded {
+      colorReadbackNeeded = false
+      isProbing = true
+      let generation = epoch
+      let codes = colorFeatures.map(\.id)
+      let persist = persistColorReadback
+      session.perform { s in
+        let values = Self.readColors(codes, session: s)
+        DispatchQueue.main.async { [weak self] in
+          guard let self, self.epoch == generation else { return }
+          for (code, value) in values { self.adopt(code, value, persist: persist) }
+          if values.count != codes.count { self.lastError = "Some color values could not be read. Try Refresh." }
+          self.isProbing = false
+          self.finishWork()
         }
       }
+    } else if refreshRequested {
+      refreshRequested = false
+      probe()
     }
   }
 }

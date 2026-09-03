@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import Foundation
 
 public struct DisplaySettings: Codable {
@@ -6,31 +7,47 @@ public struct DisplaySettings: Codable {
   public var values: [String: UInt16] = [:]
 }
 
-/// Persists each display's last-known feature values by EDID identity, so they
-/// can be re-applied after relaunch, reconnect, or wake. Monitors frequently
-/// reset their own internal DDC state (brightness/contrast/gains) on their own
-/// power cycle even when macOS never reports the display as offline, so restore
-/// is driven by DisplayManager on every refresh — not just on (re)connect.
-///
-/// Writes are debounced (a slider drag shouldn't hit disk on every tick) and
-/// flushed immediately on app termination so the last change isn't lost.
-public final class SettingsStore {
+/// Stores confirmed values. Cache access and complete disk saves have separate
+/// locks: save serialization starts BEFORE taking a snapshot, including flush.
+public final class SettingsStore: ObservableObject {
+  @Published public private(set) var lastError: String?
   private let url: URL
   private let lock = NSLock()
+  private let saveLock = NSLock()
   private var cache: [String: DisplaySettings] = [:]
-  private var saveScheduled = false
+  private var pendingSave: DispatchWorkItem?
+  private var dirty = false
+  private var loadFailed = false
+  private var terminationObserver: NSObjectProtocol?
+  private let writeData: (Data, URL) throws -> Void
 
-  public init() {
+  public convenience init(directory: URL? = nil) {
+    self.init(directory: directory, writeData: { try $0.write(to: $1, options: .atomic) })
+  }
+
+  init(directory: URL?, writeData: @escaping (Data, URL) throws -> Void) {
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
       ?? FileManager.default.temporaryDirectory
-    let dir = base.appendingPathComponent("DisplayControl", isDirectory: true)
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    self.url = dir.appendingPathComponent("displays.json")
-    self.load()
-
-    NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
-      self?.flush()
+    let dir = directory ?? base.appendingPathComponent("DisplayControl", isDirectory: true)
+    url = dir.appendingPathComponent("displays.json")
+    self.writeData = writeData
+    do {
+      try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+      if FileManager.default.fileExists(atPath: url.path) {
+        cache = try JSONDecoder().decode([String: DisplaySettings].self, from: Data(contentsOf: url))
+      }
+    } catch {
+      loadFailed = true
+      lastError = "Saved settings could not be loaded. The existing file was left unchanged. \(error.localizedDescription)"
     }
+    terminationObserver = NotificationCenter.default.addObserver(
+      forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+    ) { [weak self] _ in self?.flush() }
+  }
+
+  deinit {
+    pendingSave?.cancel()
+    if let terminationObserver { NotificationCenter.default.removeObserver(terminationObserver) }
   }
 
   public func settings(for identityKey: String) -> DisplaySettings? {
@@ -40,31 +57,44 @@ public final class SettingsStore {
 
   public func update(identityKey: String, code: UInt8, value: UInt16) {
     lock.lock()
-    var s = cache[identityKey] ?? DisplaySettings(identityKey: identityKey)
-    s.values[String(code)] = value
-    cache[identityKey] = s
-    let schedule = !saveScheduled
-    if schedule { saveScheduled = true }
+    var settings = cache[identityKey] ?? DisplaySettings(identityKey: identityKey)
+    guard settings.values[String(code)] != value else { lock.unlock(); return }
+    settings.values[String(code)] = value
+    cache[identityKey] = settings
+    dirty = true
+    pendingSave?.cancel()
+    let work = DispatchWorkItem { [weak self] in _ = self?.performSave() }
+    pendingSave = work
     lock.unlock()
-    if schedule {
-      DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.performSave() }
+    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5, execute: work)
+  }
+
+  @discardableResult
+  public func flush() -> Bool { performSave() }
+
+  private func performSave() -> Bool {
+    saveLock.lock(); defer { saveLock.unlock() }
+    lock.lock()
+    guard !loadFailed else { lock.unlock(); return false }
+    guard dirty else { lock.unlock(); return true }
+    pendingSave?.cancel()
+    pendingSave = nil
+    let snapshot = cache
+    dirty = false
+    lock.unlock()
+    do {
+      let data = try JSONEncoder().encode(snapshot)
+      try writeData(data, url)
+      publishError(nil)
+      return true
+    } catch {
+      lock.lock(); dirty = true; lock.unlock()
+      publishError("Settings could not be saved. \(error.localizedDescription)")
+      return false
     }
   }
 
-  public func flush() { performSave() }
-
-  private func load() {
-    guard let data = try? Data(contentsOf: url),
-          let decoded = try? JSONDecoder().decode([String: DisplaySettings].self, from: data) else { return }
-    lock.lock(); cache = decoded; lock.unlock()
-  }
-
-  private func performSave() {
-    lock.lock()
-    saveScheduled = false
-    let snapshot = cache
-    lock.unlock()
-    guard let data = try? JSONEncoder().encode(snapshot) else { return }
-    try? data.write(to: url, options: .atomic)
+  private func publishError(_ message: String?) {
+    DispatchQueue.main.async { [weak self] in self?.lastError = message }
   }
 }

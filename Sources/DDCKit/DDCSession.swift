@@ -1,90 +1,89 @@
 import Foundation
-import CDDCPrivate
 
-/// Per-display serial DDC channel with a watchdog.
-///
-/// Design goals, learned the hard way:
-///  • **No overlapping I2C.** Every read/write for a display runs on a single
-///    serial `worker` queue, so transactions to a monitor never overlap —
-///    concurrent access can wedge a monitor's DDC controller (and, cascading,
-///    the whole Apple-Silicon DCP) until a reboot.
-///  • **Never block indefinitely.** Each I2C op is run with a caller-side
-///    timeout. `IOAVServiceReadI2C`/`WriteI2C` can hang uninterruptibly when a
-///    monitor is wedged; the timeout stops that from freezing a display's queue.
-///  • **Don't pile onto a stuck display.** After a timeout the session is marked
-///    `stalled` and refuses to start new I2C until the stuck op drains, so we
-///    never launch a second overlapping transaction or back up unbounded work.
-///  • **Confirm writes on flaky panels.** Settled slider values are read back and
-///    re-driven a couple of times if the monitor ignored them, then we stop.
+enum DDCWriteResult {
+  case confirmed(DDCValue)
+  case failed(actual: DDCValue?)
+  case superseded
+}
+
+/// One scheduler and worker survive service replacement/reconnection.
+/// A timed-out syscall keeps the worker occupied until it actually returns.
 final class DDCSession {
-  let service: IOAVService?
-  private let ioTimeout: TimeInterval
-
   private let scheduler = DispatchQueue(label: "ddc.scheduler", qos: .userInitiated)
   private let worker = DispatchQueue(label: "ddc.worker", qos: .userInitiated)
-
   private let lock = NSLock()
-  private var latest: [UInt8: UInt16] = [:]
+  private var transport: DDCTransport?
+  private var activeOperation: UUID?
+  private var generation = UUID()
+  // Accessed only on the scheduler; pins multi-step operations to a connection.
+  private var orchestrationGeneration: UUID?
+  private var latest: [UInt8: PendingWrite] = [:]
   private var drainScheduled = false
-
-  private let stateLock = NSLock()
-  private var _stalled = false
-
-  /// Minimum spacing between write batches while dragging a slider. The UI
-  /// updates optimistically and instantly regardless (see Display.set), so this
-  /// only paces the hardware writes — it doesn't add perceptible input lag, and
-  /// it keeps flaky monitors (which can drop writes fired faster than they can
-  /// absorb them) from being flooded mid-drag.
+  private let ioTimeout: TimeInterval
   private let writeThrottle: TimeInterval
+  private let settleDelay: UInt32
 
-  init(service: IOAVService?, ioTimeout: TimeInterval = 2.0, writeThrottle: TimeInterval = 0.08) {
-    self.service = service
-    self.ioTimeout = ioTimeout
-    self.writeThrottle = writeThrottle
+  private struct PendingWrite {
+    let generation: UUID
+    let value: UInt16
+    let completion: (DDCWriteResult) -> Void
   }
 
-  /// False after an I/O timed out and the stuck worker op hasn't drained yet.
-  var isResponsive: Bool { stateLock.lock(); defer { stateLock.unlock() }; return !_stalled }
-  private var stalled: Bool { stateLock.lock(); defer { stateLock.unlock() }; return _stalled }
-  private func setStalled(_ v: Bool) { stateLock.lock(); _stalled = v; stateLock.unlock() }
+  init(transport: DDCTransport?, ioTimeout: TimeInterval = 2,
+       writeThrottle: TimeInterval = 0.08, settleDelay: UInt32 = 50_000) {
+    self.transport = transport
+    self.ioTimeout = ioTimeout
+    self.writeThrottle = writeThrottle
+    self.settleDelay = settleDelay
+  }
 
-  // MARK: - Public API
+  func replaceTransport(_ transport: DDCTransport?) {
+    lock.lock(); self.transport = transport; lock.unlock()
+  }
 
-  /// Coalesced, throttled, watchdog-protected write for sliders. Fire-and-forget;
-  /// multiple rapid updates within the throttle window collapse to the latest
-  /// value per VCP code, and are dispatched together after `writeThrottle`.
-  func write(_ code: UInt8, _ value: UInt16) {
+  func cancelPendingWrites() {
     lock.lock()
-    latest[code] = value
-    let schedule = !drainScheduled
-    if schedule { drainScheduled = true }
+    generation = UUID()
+    let cancelled = latest
+    latest.removeAll()
     lock.unlock()
+    for pending in cancelled.values { pending.completion(.superseded) }
+  }
+
+  func write(_ code: UInt8, _ value: UInt16, completion: @escaping (DDCWriteResult) -> Void) {
+    lock.lock()
+    let replaced = latest.updateValue(PendingWrite(generation: generation, value: value, completion: completion), forKey: code)
+    let schedule = !drainScheduled
+    drainScheduled = true
+    lock.unlock()
+    replaced?.completion(.superseded)
     if schedule {
       scheduler.asyncAfter(deadline: .now() + writeThrottle) { [weak self] in self?.drain() }
     }
   }
 
-  /// Serialized, watchdog-protected read. Call from inside `perform` (never the
-  /// main thread). Returns nil on read failure or timeout.
-  func read(_ code: UInt8) -> (current: UInt16, max: UInt16)? {
-    runOnWorker { Arm64DDC.read(service: self.service, command: code) } ?? nil
+  func read(_ code: UInt8) -> DDCValue? {
+    runOnWorker(expectedGeneration: orchestrationGeneration) { $0.read(code) } ?? nil
   }
 
-  /// One serialized write, no verification (for action opcodes like 0x08).
-  func writeOnce(_ code: UInt8, _ value: UInt16) {
-    _ = runOnWorker { Arm64DDC.write(service: self.service, command: code, value: value); return true }
+  @discardableResult
+  func writeOnce(_ code: UInt8, _ value: UInt16, generation: UUID? = nil) -> Bool {
+    runOnWorker(expectedGeneration: generation ?? orchestrationGeneration) { $0.write(code, value) } ?? false
   }
 
-  /// Run an orchestration block (e.g. probe, color reset) on the scheduler queue,
-  /// serialized with slider writes. Use the passed session's read/write inside.
   func perform(_ block: @escaping (DDCSession) -> Void) {
-    scheduler.async { [weak self] in
-      guard let self else { return }
+    lock.lock(); let token = generation; lock.unlock()
+    scheduler.async {
+      self.orchestrationGeneration = token
+      defer { self.orchestrationGeneration = nil }
       block(self)
     }
   }
 
-  // MARK: - Internals
+  private func isSuperseded(_ code: UInt8, generation expected: UUID) -> Bool {
+    lock.lock(); defer { lock.unlock() }
+    return generation != expected || latest[code] != nil
+  }
 
   private func drain() {
     lock.lock()
@@ -93,50 +92,50 @@ final class DDCSession {
     drainScheduled = false
     lock.unlock()
 
-    for (code, value) in batch {
-      _ = runOnWorker { Arm64DDC.write(service: self.service, command: code, value: value); return true }
-    }
-
-    // Verify only settled values (nothing newer queued) so drags stay smooth.
-    lock.lock(); let settled = latest.isEmpty; lock.unlock()
-    if settled {
-      for (code, value) in batch { verifySettled(code, value) }
+    // Select and verify the color slot before adjusting its gains.
+    let codes = batch.keys.sorted { ($0 == 0x14 ? -1 : Int($0)) < ($1 == 0x14 ? -1 : Int($1)) }
+    for code in codes {
+      guard let pending = batch[code] else { continue }
+      pending.completion(verifyWrite(code, pending.value, generation: pending.generation))
     }
   }
 
-  /// Read back a settled value; if the monitor ignored the write, re-drive it a
-  /// couple of times, then give up. Bails out if a newer drag value supersedes.
-  private func verifySettled(_ code: UInt8, _ value: UInt16, retries: Int = 2) {
-    for _ in 0 ..< retries {
-      lock.lock(); let superseded = latest[code] != nil; lock.unlock()
-      if superseded { return }
-      guard let r = runOnWorker({ Arm64DDC.read(service: self.service, command: code) }) ?? nil else {
-        return // read unsupported or timed out — stop, don't thrash
-      }
-      if r.current == value { return }
-      _ = runOnWorker { Arm64DDC.write(service: self.service, command: code, value: value); return true }
-      usleep(40_000)
+  private func verifyWrite(_ code: UInt8, _ value: UInt16, generation: UUID) -> DDCWriteResult {
+    var actual: DDCValue?
+    for _ in 0..<3 {
+      if isSuperseded(code, generation: generation) { return .superseded }
+      let sent = writeOnce(code, value, generation: generation)
+      if settleDelay > 0 { usleep(settleDelay) }
+      actual = read(code)
+      if isSuperseded(code, generation: generation) { return .superseded }
+      if let actual, actual.current == value { return .confirmed(actual) }
+      if !sent || actual == nil { break }
     }
+    return .failed(actual: actual)
   }
 
-  /// Run an I2C op on the serial worker with a caller-side timeout. If a previous
-  /// op is stuck (stalled), skip entirely rather than enqueue a second op — this
-  /// is what guarantees transactions never overlap under a hung syscall.
-  private func runOnWorker<T>(_ op: @escaping () -> T) -> T? {
-    if stalled { return nil }
-    let sem = DispatchSemaphore(value: 0)
-    let box = Box<T>()
-    worker.async { [weak self] in
-      box.value = op()
-      sem.signal()
-      self?.setStalled(false)
+  private func runOnWorker<T>(expectedGeneration: UUID? = nil, _ op: @escaping (DDCTransport) -> T) -> T? {
+    lock.lock()
+    guard activeOperation == nil, expectedGeneration == nil || expectedGeneration == generation, let transport else { lock.unlock(); return nil }
+    let token = UUID()
+    activeOperation = token
+    lock.unlock()
+
+    let done = DispatchSemaphore(value: 0)
+    let box = ResultBox<T>()
+    worker.async {
+      let value = op(transport)
+      self.lock.lock()
+      box.value = value
+      if self.activeOperation == token { self.activeOperation = nil }
+      self.lock.unlock()
+      done.signal()
     }
-    if sem.wait(timeout: .now() + ioTimeout) == .timedOut {
-      setStalled(true)
-      return nil
-    }
+    // Timeout never mutates worker state: completion alone releases the slot.
+    guard done.wait(timeout: .now() + ioTimeout) == .success else { return nil }
+    lock.lock(); defer { lock.unlock() }
     return box.value
   }
 }
 
-private final class Box<T> { var value: T? }
+private final class ResultBox<T> { var value: T? }

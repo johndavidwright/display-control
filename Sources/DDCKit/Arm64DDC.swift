@@ -9,9 +9,6 @@ import Foundation
 import IOKit
 import CDDCPrivate
 
-let ARM64_DDC_7BIT_ADDRESS: UInt8 = 0x37 // DisplayPort DDC 7-bit address
-let ARM64_DDC_DATA_ADDRESS: UInt8 = 0x51
-
 enum Arm64DDC {
   static let MAX_MATCH_SCORE = 20
 
@@ -87,56 +84,6 @@ enum Arm64DDC {
     return score
   }
 
-  // MARK: - I2C read / write
-
-  static func read(service: IOAVService?, command: UInt8) -> (current: UInt16, max: UInt16)? {
-    var send: [UInt8] = [command]
-    var reply = [UInt8](repeating: 0, count: 11)
-    guard self.performDDCCommunication(service: service, send: &send, reply: &reply) else { return nil }
-    let max = UInt16(reply[6]) * 256 + UInt16(reply[7])
-    let current = UInt16(reply[8]) * 256 + UInt16(reply[9])
-    return (current, max)
-  }
-
-  @discardableResult
-  static func write(service: IOAVService?, command: UInt8, value: UInt16) -> Bool {
-    var send: [UInt8] = [command, UInt8(value >> 8), UInt8(value & 255)]
-    var reply: [UInt8] = []
-    return self.performDDCCommunication(service: service, send: &send, reply: &reply)
-  }
-
-  static func performDDCCommunication(service: IOAVService?, send: inout [UInt8], reply: inout [UInt8],
-                                      writeSleepTime: UInt32 = 10000, numOfWriteCycles: UInt8 = 2,
-                                      readSleepTime: UInt32 = 50000, numOfRetryAttemps: UInt8 = 4,
-                                      retrySleepTime: UInt32 = 20000) -> Bool {
-    guard service != nil else { return false }
-    let dataAddress = ARM64_DDC_DATA_ADDRESS
-    var success = false
-    var packet: [UInt8] = [UInt8(0x80 | (send.count + 1)), UInt8(send.count)] + send + [0]
-    packet[packet.count - 1] = self.checksum(chk: send.count == 1 ? ARM64_DDC_7BIT_ADDRESS << 1 : ARM64_DDC_7BIT_ADDRESS << 1 ^ dataAddress, data: &packet, start: 0, end: packet.count - 2)
-    for _ in 1 ... numOfRetryAttemps + 1 {
-      for _ in 1 ... max(numOfWriteCycles, 1) {
-        usleep(writeSleepTime)
-        success = IOAVServiceWriteI2C(service, UInt32(ARM64_DDC_7BIT_ADDRESS), UInt32(dataAddress), &packet, UInt32(packet.count)) == 0
-      }
-      if !reply.isEmpty {
-        usleep(readSleepTime)
-        if IOAVServiceReadI2C(service, UInt32(ARM64_DDC_7BIT_ADDRESS), 0, &reply, UInt32(reply.count)) == 0 {
-          success = self.checksum(chk: 0x50, data: &reply, start: 0, end: reply.count - 2) == reply[reply.count - 1]
-        }
-      }
-      if success { return true }
-      usleep(retrySleepTime)
-    }
-    return success
-  }
-
-  static func checksum(chk: UInt8, data: inout [UInt8], start: Int, end: Int) -> UInt8 {
-    var c = chk
-    for i in start ... end { c ^= data[i] }
-    return c
-  }
-
   // MARK: - IORegistry traversal (ported from MonitorControl)
 
   static func getIoregServicesForMatching() -> [IOregService] {
@@ -153,6 +100,7 @@ enum Arm64DDC {
     let keysFB = ["AppleCLCD2", "IOMobileFramebufferShim"]
     var current = IOregService()
     while let obj = self.iterateToNextObjectOfInterest(interests: [keyProxy] + keysFB, iterator: &iterator) {
+      defer { IOObjectRelease(obj.entry) }
       if keysFB.contains(obj.name) {
         current = self.appleCLCD2Properties(entry: obj.entry)
         serviceLocation += 1
@@ -170,11 +118,16 @@ enum Arm64DDC {
     defer { name.deallocate() }
     while true {
       let entry = IOIteratorNext(iterator)
-      guard entry != MACH_PORT_NULL, IORegistryEntryGetName(entry, name) == KERN_SUCCESS else { break }
+      guard entry != MACH_PORT_NULL else { break }
+      guard IORegistryEntryGetName(entry, name) == KERN_SUCCESS else {
+        IOObjectRelease(entry)
+        continue
+      }
       let nameString = String(cString: name)
       for interest in interests where entry != IO_OBJECT_NULL && nameString.contains(interest) {
         return (nameString, entry)
       }
+      IOObjectRelease(entry)
     }
     return nil
   }
@@ -187,8 +140,9 @@ enum Arm64DDC {
     }
     let cpath = UnsafeMutablePointer<CChar>.allocate(capacity: MemoryLayout<io_string_t>.size)
     defer { cpath.deallocate() }
-    IORegistryEntryGetPath(entry, kIOServicePlane, cpath)
-    s.ioDisplayLocation = String(cString: cpath)
+    if IORegistryEntryGetPath(entry, kIOServicePlane, cpath) == KERN_SUCCESS {
+      s.ioDisplayLocation = String(cString: cpath)
+    }
     if let u = IORegistryEntryCreateCFProperty(entry, "DisplayAttributes" as CFString, kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively)),
        let attrs = u.takeRetainedValue() as? NSDictionary,
        let product = attrs.value(forKey: "ProductAttributes") as? NSDictionary {
@@ -206,6 +160,7 @@ enum Arm64DDC {
   }
 
   static func dcpavServiceProxy(entry: io_service_t, ioregService: inout IOregService) {
+    ioregService.service = nil
     if let u = IORegistryEntryCreateCFProperty(entry, "Location" as CFString, kCFAllocatorDefault, IOOptionBits(kIORegistryIterateRecursively)),
        let location = u.takeRetainedValue() as? String {
       ioregService.location = location

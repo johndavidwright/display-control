@@ -14,7 +14,7 @@ struct DisplayPresetsView: View {
   private var presets: [DisplayPreset] { presetStore.presets(for: display.identityKey) }
 
   var body: some View {
-    DisclosureGroup(isExpanded: $expanded) {
+    StableDisclosureGroup(isExpanded: $expanded) {
       VStack(alignment: .leading, spacing: 6) {
         if presets.isEmpty && !isAdding {
           Text("No presets saved for this display yet.")
@@ -30,6 +30,7 @@ struct DisplayPresetsView: View {
               Text(preset.name).font(.caption)
             }
             .buttonStyle(.plain)
+            .disabled(display.isBusy)
             Spacer()
             Button {
               presetStore.delete(preset, for: display.identityKey)
@@ -48,7 +49,7 @@ struct DisplayPresetsView: View {
               .font(.caption)
               .onSubmit(savePreset)
             Button("Save", action: savePreset)
-              .disabled(trimmedName.isEmpty)
+              .disabled(trimmedName.isEmpty || display.isBusy)
           }
         } else {
           Button {
@@ -61,6 +62,7 @@ struct DisplayPresetsView: View {
         }
       }
       .padding(.top, 6)
+      if let error = presetStore.lastError { Text(error).font(.caption).foregroundStyle(.red) }
     } label: {
       Label("Presets", systemImage: "star")
         .font(.caption).bold()
@@ -73,7 +75,7 @@ struct DisplayPresetsView: View {
 
   private func savePreset() {
     guard !trimmedName.isEmpty else { return }
-    presetStore.save(name: trimmedName, for: display)
+    guard presetStore.save(name: trimmedName, for: display) else { return }
     newName = ""
     isAdding = false
   }

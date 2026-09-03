@@ -1,141 +1,126 @@
-// DDC diagnostics: exercises DDCKit's DisplayManager + Display exactly as the
-// app does, and prints what it detects. Always runs with autoRestore: false, so
-// unlike the real app it never reads or writes the persisted settings file and
-// never pushes saved values to hardware on launch — the default mode is fully
-// read-only; `set`/`presettest` make only the write you explicitly ask for.
-
 import DDCKit
+import DiagnoseSupport
 import Foundation
 
-// Optional: `ddc-diagnose presettest <name-substring>` — switches that display
-// to preset 11 (a "User" slot) and tests whether gain writes then take effect.
-// Uses the normal watchdog-protected Display.set() path (bounded, verified,
-// isolated per-display) — same safety as the app itself.
-if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "presettest" {
-  let needle = CommandLine.arguments[2].lowercased()
-  let mgr = DisplayManager(autoRestore: false)
-  RunLoop.main.run(until: Date().addingTimeInterval(3.0))
-  guard let d = mgr.displays.first(where: { $0.name.lowercased().contains(needle) }) else {
-    print("no display matching '\(needle)'"); exit(1)
-  }
-  print("\(d.name): preset before = \(d.value(for: 0x14))")
-  print("→ switching to preset 11 (User slot)…")
-  d.set(0x14, 11)
-  RunLoop.main.run(until: Date().addingTimeInterval(2.0))
-  print("preset after = \(d.value(for: 0x14))")
-
-  print("→ writing Red gain = 150…")
-  d.set(0x16, 150)
-  RunLoop.main.run(until: Date().addingTimeInterval(2.0))
-  print("Red gain after write+verify = \(d.value(for: 0x16))  (wanted 150)")
-  exit(0)
+struct DiagnosticFailure: LocalizedError {
+  let errorDescription: String?
+  init(_ message: String) { errorDescription = message }
 }
 
-// `ddc-diagnose persist-set <name> <vcpHex> <value>` — like `set`, but with
-// autoRestore: true (same as the real app), so the write is also persisted.
-if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "persist-set" {
-  let needle = CommandLine.arguments[2].lowercased()
-  guard let code = UInt8(CommandLine.arguments[3], radix: 16), let value = UInt16(CommandLine.arguments[4]) else {
-    print("usage: ddc-diagnose persist-set <name> <vcpHex> <value>"); exit(2)
+func waitUntil(_ completed: () -> Bool, timeout: TimeInterval = 30) throws {
+  let deadline = Date().addingTimeInterval(timeout)
+  while !completed() {
+    guard Date() < deadline else { throw DiagnosticFailure("Timed out waiting for the monitor.") }
+    RunLoop.main.run(until: Date().addingTimeInterval(0.02))
   }
-  let mgr = DisplayManager(autoRestore: true)
-  RunLoop.main.run(until: Date().addingTimeInterval(3.0))
-  guard let d = mgr.displays.first(where: { $0.name.lowercased().contains(needle) }) else {
-    print("no display matching '\(needle)'"); exit(1)
-  }
-  d.set(code, value)
-  RunLoop.main.run(until: Date().addingTimeInterval(2.0)) // let write+verify+debounced save land
-  print("\(d.name): set+persisted 0x\(String(format: "%02X", code)) = \(d.value(for: code))")
-  exit(0)
 }
 
-// `ddc-diagnose persist-check <name> <vcpHex>` — fresh DisplayManager with
-// autoRestore: true and NO explicit write, exactly what the real app does on
-// launch. Prints the value after auto-restore, to confirm saved settings are
-// actually re-applied to hardware (not just present on disk).
-if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "persist-check" {
-  let needle = CommandLine.arguments[2].lowercased()
-  let code = CommandLine.arguments.count >= 4 ? UInt8(CommandLine.arguments[3], radix: 16) ?? 0x12 : 0x12
-  let mgr = DisplayManager(autoRestore: true)
-  RunLoop.main.run(until: Date().addingTimeInterval(3.0))
-  guard let d = mgr.displays.first(where: { $0.name.lowercased().contains(needle) }) else {
-    print("no display matching '\(needle)'"); exit(1)
+func target(named name: String, manager: DisplayManager) throws -> Display {
+  let matches = manager.controllable.filter { $0.name.localizedCaseInsensitiveContains(name) }
+  guard matches.count == 1 else {
+    throw DiagnosticFailure("Expected one controllable display matching '\(name)', found \(matches.count).")
   }
-  print("\(d.name): 0x\(String(format: "%02X", code)) after auto-restore = \(d.value(for: code))")
-  exit(0)
+  return matches[0]
 }
 
-// `ddc-diagnose set <name-substring> <vcpHex> <value>` — one verified write via
-// the normal Display.set() path.
-if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "set" {
-  let needle = CommandLine.arguments[2].lowercased()
-  guard let code = UInt8(CommandLine.arguments[3], radix: 16), let value = UInt16(CommandLine.arguments[4]) else {
-    print("usage: ddc-diagnose set <name> <vcpHex> <value>"); exit(2)
-  }
-  let mgr = DisplayManager(autoRestore: false)
-  RunLoop.main.run(until: Date().addingTimeInterval(3.0))
-  guard let d = mgr.displays.first(where: { $0.name.lowercased().contains(needle) }) else {
-    print("no display matching '\(needle)'"); exit(1)
-  }
-  d.set(code, value)
-  RunLoop.main.run(until: Date().addingTimeInterval(2.0))
-  print("\(d.name): 0x\(String(format: "%02X", code)) = \(d.value(for: code))  (wanted \(value))")
-  exit(0)
+func checkResult(_ display: Display) throws {
+  try waitUntil { !display.isBusy }
+  if let error = display.lastError { throw DiagnosticFailure(error) }
 }
 
-// `ddc-diagnose preset-test` — exercises per-display PresetStore save/apply
-// against a temp directory (never touches the real app's presets.json). Read
-// side is zero-risk (just snapshots current features); the apply step
-// re-writes the display's OWN just-read values back to itself, so hardware
-// state is unchanged, but it proves the full save→persist→decode→apply
-// round trip, scoped to one display.
-if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "preset-test" {
-  let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("ddc-preset-test-\(UUID().uuidString)")
-  let mgr = DisplayManager(autoRestore: false)
-  RunLoop.main.run(until: Date().addingTimeInterval(3.0))
-  guard let target = mgr.controllable.first else { print("no controllable displays"); exit(1) }
-  print("target display: \(target.name)")
-
-  let store = PresetStore(directory: tmpDir)
-  print("presets.json at: \(tmpDir.path)/presets.json")
-  store.save(name: "Test Preset", for: target)
-  print("saved preset with \(store.presets(for: target.identityKey).first?.values.count ?? 0) value(s)")
-
-  guard let onDisk = try? Data(contentsOf: tmpDir.appendingPathComponent("presets.json")) else {
-    print("FAIL: presets.json was not written"); exit(1)
-  }
-  print("on-disk bytes: \(onDisk.count)")
-
-  // Fresh store instance reading the same directory — proves decode works, not
-  // just the in-memory array from save().
-  let reloaded = PresetStore(directory: tmpDir)
-  guard let preset = reloaded.presets(for: target.identityKey).first(where: { $0.name == "Test Preset" }) else {
-    print("FAIL: preset not found after reload"); exit(1)
-  }
-  print("reloaded preset '\(preset.name)' with \(preset.values.count) value(s)")
-
-  reloaded.apply(preset, to: target)
-  RunLoop.main.run(until: Date().addingTimeInterval(2.0))
-  print("apply() completed without error")
-
-  try? FileManager.default.removeItem(at: tmpDir)
-  print("PASS")
-  exit(0)
+func checkedWrite(_ display: Display, code: UInt8, value: UInt16) throws -> UInt16 {
+  guard let feature = display.features[code] else { throw DiagnosticFailure("This monitor does not expose the requested control.") }
+  let expected = min(value, feature.max)
+  display.set(code, value)
+  try checkResult(display)
+  guard display.value(for: code) == expected else { throw DiagnosticFailure("Monitor readback did not match the requested value.") }
+  print("\(display.name): 0x\(String(format: "%02X", code)) readback = \(expected) (requested \(value))")
+  return expected
 }
 
-let manager = DisplayManager(autoRestore: false)
-// DisplayManager enumerates on the main thread and probes each display on a
-// background queue; spin the run loop briefly to let the probes publish.
-RunLoop.main.run(until: Date().addingTimeInterval(3.0))
-
-print("Detected \(manager.displays.count) display(s); \(manager.controllable.count) DDC-controllable.\n")
-for d in manager.displays {
-  let tag = d.isBuiltin ? "built-in" : (d.supportsDDC ? "DDC" : "no DDC")
-  print("• \(d.name)  [\(tag)]  id=\(d.identityKey.prefix(8))…")
-  guard d.supportsDDC else { print(""); continue }
-  for f in (d.mainFeatures + d.colorFeatures) {
-    let kind = f.code.isColor ? "color" : "main "
-    print(String(format: "    0x%02X %-11@ [%@] %d / %d", f.code.code, f.code.name as NSString, kind as NSString, Int(f.current), Int(f.max)))
+func run(_ command: DiagnosticCommand) throws {
+  if command == .help { print(DiagnosticCommand.usage); return }
+  // Never restore unrelated displays or write real settings during discovery.
+  let manager = DisplayManager(autoRestore: false)
+  try waitUntil { !manager.isBusy }
+  switch command {
+  case .help:
+    break
+  case .list:
+    print("Detected \(manager.displays.count) display(s); \(manager.controllable.count) DDC-controllable.\n")
+    for display in manager.displays {
+      print("• \(display.name) [\(display.isBuiltin ? "built-in" : display.supportsDDC ? "DDC" : "no DDC")]\n  id=\(display.identityKey)")
+      for feature in display.mainFeatures + display.colorFeatures {
+        print("  0x\(String(format: "%02X", feature.id)) \(feature.code.name): \(feature.current) / \(feature.max)")
+      }
+      if let error = display.lastError { print("  \(error)") }
+    }
+  case let .set(name, code, value, persist):
+    let display = try target(named: name, manager: manager)
+    let actual = try checkedWrite(display, code: code, value: value)
+    if persist {
+      let store = SettingsStore()
+      store.update(identityKey: display.identityKey, code: code, value: actual)
+      // Selecting a color slot can also change gains; persist those readbacks.
+      if code == 0x14 {
+        for feature in display.colorFeatures {
+          store.update(identityKey: display.identityKey, code: feature.id, value: feature.current)
+        }
+      }
+      guard store.flush() else { throw DiagnosticFailure("The hardware changed, but settings could not be saved.") }
+      print("Confirmed values saved.")
+    }
+  case let .persistCheck(name, code):
+    let display = try target(named: name, manager: manager)
+    let store = SettingsStore()
+    if let error = store.lastError { throw DiagnosticFailure(error) }
+    guard let saved = store.settings(for: display.identityKey),
+          let requested = saved.values[String(code)], let feature = display.features[code] else {
+      throw DiagnosticFailure("No saved value exists for that supported control.")
+    }
+    display.apply(saved.values)
+    try checkResult(display)
+    display.probe(restoreSavedSettings: false)
+    try checkResult(display)
+    guard display.value(for: code) == min(requested, feature.max) else { throw DiagnosticFailure("Saved value was not restored on the monitor.") }
+    print("\(display.name): confirmed restored readback = \(display.value(for: code))")
+  case let .colorTest(name):
+    let display = try target(named: name, manager: manager)
+    guard display.features[0x14]?.max ?? 0 >= 11, display.features[0x16] != nil else {
+      throw DiagnosticFailure("The display must expose User 1 and red gain.")
+    }
+    _ = try checkedWrite(display, code: 0x14, value: 11)
+    _ = try checkedWrite(display, code: 0x16, value: 150)
+  case .presetTest:
+    guard let display = manager.controllable.first else { throw DiagnosticFailure("No controllable displays.") }
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("ddc-preset-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = PresetStore(directory: directory)
+    guard store.save(name: "Test Preset", for: display) else { throw DiagnosticFailure(store.lastError ?? "Could not save preset.") }
+    let reloaded = PresetStore(directory: directory)
+    guard let preset = reloaded.presets(for: display.identityKey).first,
+          preset.values == display.confirmedSnapshot else { throw DiagnosticFailure("Preset reload did not match the saved values.") }
+    reloaded.apply(preset, to: display)
+    try checkResult(display)
+    display.probe(restoreSavedSettings: false)
+    try checkResult(display)
+    guard preset.values.allSatisfy({ display.confirmedSnapshot[$0.key] == $0.value }) else {
+      throw DiagnosticFailure("Monitor readbacks did not match the preset.")
+    }
+    print("PASS: saved, reloaded, applied, and verified \(display.name)'s preset.")
   }
-  print("")
+}
+
+let command: DiagnosticCommand
+do {
+  command = try DiagnosticCommand(arguments: Array(CommandLine.arguments.dropFirst()))
+} catch {
+  fputs(DiagnosticCommand.usage + "\n", stderr)
+  exit(2)
+}
+do {
+  try run(command)
+} catch {
+  fputs("Error: \(error.localizedDescription)\n", stderr)
+  exit(1)
 }

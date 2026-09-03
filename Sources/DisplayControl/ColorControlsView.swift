@@ -11,7 +11,7 @@ struct ColorControlsView: View {
   private let presetCode: UInt8 = 0x14
 
   var body: some View {
-    DisclosureGroup(isExpanded: $expanded) {
+    StableDisclosureGroup(isExpanded: $expanded) {
       VStack(alignment: .leading, spacing: 8) {
         ForEach(gainFeatures) { feature in
           FeatureSlider(display: display, feature: feature, icon: gainIcon(feature.code.code))
@@ -31,6 +31,7 @@ struct ColorControlsView: View {
             .pickerStyle(.menu)
             .font(.caption)
             .frame(maxWidth: 130)
+            .disabled(display.isProbing || display.isResetting)
           }
         }
 
@@ -40,6 +41,7 @@ struct ColorControlsView: View {
           Label("Reset color to factory", systemImage: "arrow.uturn.backward")
             .font(.caption)
         }
+        .disabled(display.isBusy)
         .buttonStyle(.borderless)
         .padding(.top, 2)
       }

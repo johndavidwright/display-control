@@ -6,23 +6,29 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 CONFIG="${1:-release}"
-APP="$ROOT/DisplayControl.app"
+APP="${2:-$ROOT/DisplayControl.app}"
+case "$APP" in
+  /*.app) ;;
+  *) echo "Destination must be an absolute path ending in .app" >&2; exit 2 ;;
+esac
 BUNDLE_ID="com.jdw.DisplayControl"
-VERSION="0.1"
+VERSION="0.2.5"
 
 echo "→ Building ($CONFIG)…"
 swift build -c "$CONFIG"
 BIN="$(swift build -c "$CONFIG" --show-bin-path)/DisplayControl"
 
-echo "→ Assembling $APP…"
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/DisplayControl"
+echo "→ Assembling ${APP}…"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+STAGED_APP="$WORK/DisplayControl.app"
+mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources"
+cp "$BIN" "$STAGED_APP/Contents/MacOS/DisplayControl"
 if [ -f "$ROOT/Resources/AppIcon.icns" ]; then
-  cp "$ROOT/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+  cp "$ROOT/Resources/AppIcon.icns" "$STAGED_APP/Contents/Resources/AppIcon.icns"
 fi
 
-cat > "$APP/Contents/Info.plist" <<PLIST
+cat > "$STAGED_APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -43,7 +49,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 echo "→ Ad-hoc code signing…"
-codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "  (codesign skipped)"
+codesign --force --sign - "$STAGED_APP"
+codesign --verify --strict "$STAGED_APP"
+mkdir -p "$(dirname "$APP")"
+rm -rf "$APP"
+mv "$STAGED_APP" "$APP"
 
 echo "✓ Built $APP"
 echo "  Run:  open \"$APP\"    (look for the sun icon in the menu bar)"

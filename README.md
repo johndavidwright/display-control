@@ -1,144 +1,189 @@
 # DisplayControl
 
-A lightweight macOS **menu bar** app that auto-detects external displays with
-**DDC/CI** support and adjusts their parameters — brightness, contrast, volume,
-and hardware **color** (RGB gain white balance + color-temperature preset) —
-capability-gated per monitor. Built for **Apple Silicon**.
+A lightweight macOS **menu bar** app for external displays with **DDC/CI**
+support. Adjust brightness, contrast, volume, RGB gains, and the monitor's color
+preset. Controls appear only when the monitor returns a valid, plausible value.
+Built for **Apple Silicon**, macOS **13+**, using SwiftUI and Swift Package Manager.
 
-## Status
+## Build and run
 
-Feature-complete for personal use: auto-detection, per-display sliders, named
-color presets, factory/neutral color reset, persistence across relaunch/wake,
-launch-at-login. See the phase checklist at the bottom.
-
-## Requirements
-
-- Apple Silicon Mac, macOS 13+
-- Xcode (or Command Line Tools) to build
-
-## Build & run
+Requires Xcode or the Command Line Tools.
 
 ```bash
-# Open in Xcode (native SwiftPM package):
-open Package.swift        # or: xed .
+swift test
+./scripts/make-app.sh
+open ./DisplayControl.app
 
-# Or from the command line:
-swift build -c release
-./scripts/make-app.sh     # produces a double-clickable DisplayControl.app
-open ./DisplayControl.app # look for the sun icon in the menu bar
+# Build a separate bundle without replacing the existing app:
+./scripts/make-app.sh release /absolute/path/to/DisplayControl.app
 
-# Headless, read-only diagnostics (list displays + detected features):
-swift run ddc-diagnose
+# Open the package in Xcode:
+xed .
 ```
 
-The app runs as a menu-bar **agent** (`LSUIElement` / `setActivationPolicy(.accessory)`),
-so there's no Dock icon. It is **unsandboxed** (required for the private
-`IOAVService` DDC path) and for **personal use** (no notarization).
+The app runs as a menu-bar agent (`LSUIElement`) without a Dock icon. It uses
+private IOAVService APIs, is unsandboxed, and is ad-hoc signed for personal use.
+It is not notarized. The packaging script verifies the signature before
+replacing the destination bundle.
+
+## Controls and saved values
+
+- Main controls: brightness `0x10`, contrast `0x12`, volume `0x62`.
+- Color controls: RGB gain `0x16/0x18/0x1A`, color preset `0x14`.
+- Factory color reset: action `0x08`.
+
+Color and Presets sections use a short fade and caret rotation. The menu stays
+anchored at the top as it changes height, preventing a flash above the title
+when a section collapses.
+
+Sliders update immediately while the hardware write runs. Each settled write is
+read back, with bounded retries if the monitor ignored it. Failed writes show an
+error and return the slider to the readback or last confirmed value. Outgoing
+values are clamped to the feature's maximum; unavailable controls are rejected.
+Only confirmed writes are saved.
+
+The XENEON EDGE (EDID vendor/product `0E5800ED`) uses different RGB scales:
+its DDC writes accept 0–100, while readbacks report 0–255. The app normalizes
+those RGB readbacks to percentages, matching the existing saved calibration
+values. This conversion is limited to that model's RGB controls; other monitors
+retain their reported scale.
+
+The monitor's Color Temp choices use the MCCS names in `ColorPreset.names`.
+Some monitors accept RGB writes only in a User color slot. Selecting a color slot
+can itself change the gains, so its readbacks are refreshed. A saved snapshot
+selects and verifies its color slot before writing the gains. Reported preset
+ranges remain monitor-dependent; a value within the reported range can still be
+rejected by firmware, in which case the app reports the failed verification.
+
+**Reset color to factory** sends the monitor's factory-reset command and reads
+its color values back. Unchanged values can mean the monitor is already at its
+defaults or does not support the command. The app reports that ambiguity and
+never substitutes maximum RGB gains for factory values.
+
+Input source switching (`0x60`) remains intentionally unsupported: the monitors
+used for this project report unreliable ranges, and switching to an inactive
+input can remove a display from macOS until it is switched back physically.
+
+## Persistence and named presets
+
+Files live in `~/Library/Application Support/DisplayControl/`:
+
+- `displays.json`: confirmed last-known values, keyed by display identity.
+  Saves are debounced and serialized; quitting flushes completed changes.
+  An in-flight hardware write has to finish before its value can be saved.
+- `presets.json`: per-display named snapshots, explicitly saved/applied/deleted.
+  Saving waits for hardware operations to settle and snapshots confirmed values.
+  Failed file operations leave the previous preset list intact.
+
+Saved settings are restored after detection, refresh, and wake. After probing,
+values that already match are left alone, including the active color slot.
+Changing the color slot still restores all snapshot values because selecting a
+slot can change the gains. Existing displays
+are re-probed, so an initial failed probe can recover without restarting the app.
+Fresh service handles reuse the display's serial worker, including across
+reconnects. Applying a named preset makes its confirmed writes the new saved
+state. Failed restore writes leave their previous saved values available for a
+later retry.
+
+Both stores report load/save errors. A malformed existing file is preserved and
+writes to it are blocked for that run. Repair or restore the file, then relaunch
+the app. Tests can inject a temporary directory for either store.
+
+Displays normally use their EDID UUID as identity, falling back to public
+vendor/model/serial information. Live display objects also use the registry connection path to keep their
+sessions separate. The existing on-disk identity format is unchanged: identical
+monitors with missing or duplicated EDID serials can still share saved settings
+and should not be assumed to have independent calibrations.
+
+## Diagnostics
+
+Quit DisplayControl and other DDC apps before running hardware diagnostics.
+The default command reads controls without restoring or saving settings. Help
+and invalid arguments are handled before any display or settings access.
+
+```bash
+swift run ddc-diagnose --help
+swift run ddc-diagnose
+
+# Explicit hardware writes; names must match exactly one controllable monitor:
+swift run ddc-diagnose set 'Dell' 10 50
+swift run ddc-diagnose persist-set 'Dell' 10 50
+
+# Restore the selected monitor's saved values and check contrast (hex 12):
+swift run ddc-diagnose persist-check 'Dell' 12
+
+# Select User 1, then write red gain 150 (clamped to the monitor's maximum):
+swift run ddc-diagnose presettest 'Dell'
+
+# Save/reload a preset in a temp directory, apply it, verify hardware readbacks:
+swift run ddc-diagnose preset-test
+```
+
+`persist-set` saves only the selected confirmed control (and associated color
+readbacks when changing the color slot). `persist-check` explicitly restores the
+selected monitor. Neither restores other monitors during discovery.
+`preset-test` does write hardware and is not a read-only test.
+
+Commands wait for operations to complete with a deadline. They report confirmed
+readbacks and exit nonzero on failure. Exit codes: `0` success, `1` operational
+failure, `2` invalid arguments. They do not infer success from an optimistic
+slider value or a fixed sleep.
 
 ## Architecture
 
+```text
+DisplayControl (SwiftUI MenuBarExtra)
+  DisplayManager  — enumerate, debounce callbacks, observe child state
+    Display       — main-thread UI state, confirmed values, reset/restore
+      DDCSession  — coalescing, ordered writes, verification, timeout handling
+        DDCTransport / PacketDDCTransport — validated DDC/CI packets
+          DDCI2C / IOAVI2C — private IOAVService calls
+  SettingsStore / PresetStore — disk persistence
+
+Arm64DDC       — IORegistry traversal and display/service matching
+CDDCPrivate    — private macOS symbol declarations
+DiagnoseSupport — argument parsing without hardware access
 ```
-DisplayControl (SwiftUI MenuBarExtra)     Sources/DisplayControl/
-  └─ DisplayManager  (enumerate, match, refresh on reconfigure/wake)
-       └─ Display     (per-display feature model, ObservableObject)
-            └─ DDCSession   (serial, watchdog-protected DDC channel)
-                 └─ Arm64DDC (IOAVService I2C + IORegistry matching)   Sources/DDCKit/
-                      └─ CDDCPrivate (private symbol declarations)     Sources/CDDCPrivate/
-```
 
-- **Arm64DDC** — I2C framing, checksum, IORegistry→`IOAVService` matching.
-  Adapted from [MonitorControl](https://github.com/MonitorControl/MonitorControl)
-  (MIT — see `THIRD_PARTY/`). Display↔service matching uses public CoreGraphics
-  vendor/product/serial instead of the private CoreDisplay dictionary.
-- **DDCSession** — one serial channel per display. All I2C is serialized (never
-  overlapping), each op has a caller-side timeout (watchdog), settled writes are
-  verified with retry, and a stalled display is isolated so it can't back up work.
-- **DisplayManager** — enumerates on the **main thread** (CoreGraphics display
-  info returns 0 if called cold on a background thread → all matches fail),
-  probes each display on its session queue, and refreshes on
-  `CGDisplayRegisterReconfigurationCallback` and `NSWorkspace.didWakeNotification`.
-- **SettingsStore** — persists each display's last-known feature values by EDID
-  identity to `~/Library/Application Support/DisplayControl/displays.json`
-  (debounced writes, flushed on quit). Re-applied on every `DisplayManager`
-  refresh — not just on (re)connect — because monitors often reset their own
-  DDC state on their own power cycle even when macOS never reports them
-  offline. Diagnostic tools run with `autoRestore: false` so they stay
-  side-effect-free against the real settings file and hardware.
+Every session has one scheduler and one serial worker. A timeout returns control
+to the scheduler but cannot interrupt a stuck kernel call. While that call is
+active, the session refuses new I/O, even if its service handle is replaced.
+Completion alone releases the worker slot, avoiding timeout/completion races.
+CoreGraphics enumeration and service creation still run on the main thread and
+are not covered by the I/O watchdog.
 
-## Detected VCP features
+## Verification
 
-Rendered only if the monitor answers a read and reports a plausible max (1–255):
-Brightness `0x10`, Contrast `0x12`, Volume `0x62`, RGB gain `0x16/0x18/0x1A`,
-Color preset `0x14`. "Reset color to factory" tries `0x08` (restore factory
-color) and, if the monitor ignores it, falls back to neutral gains (equal = max).
+`swift test` uses mock transports and temporary files. It does not access
+monitors, real saved settings, or login registration. Coverage includes invalid
+DDC replies, retries, rejected/clamped writes, coalescing, color-reset
+idempotence, color ordering, observation, reconnects, callback debouncing,
+timeout recovery, concurrent saves, persistence failures, and argument parsing.
 
-Color preset (`0x14`, labeled **"Color Temp"** in the UI) values follow the
-VESA MCCS convention (sRGB, fixed Kelvin points, User 1–3) — see
-`ColorPreset.names` in `VCPCode.swift`. RGB gain writes are only honored by some
-monitors while a **User** slot is selected; a fixed Kelvin preset can silently
-lock the gain sliders out (monitor firmware behavior, not a bug).
+For a live acceptance check, with only this DDC app running:
 
-## Presets (per-display, user-named)
+1. Open the menu during discovery and confirm controls appear when probing ends.
+2. Adjust brightness and a User-slot RGB gain; check the monitor and save a preset.
+3. Apply a different color slot, then restore the preset and confirm the readbacks.
+4. Reset color twice; the second reset must not force gains to their maximum.
+5. Sleep/wake and disconnect/reconnect a monitor; verify detection and restoration.
+6. Check Launch at Login in System Settings, including the approval-required state.
+7. Expand and collapse Color and Presets, including rapid clicks. Confirm the
+   title stays fixed and the panel does not flash or leave an empty section.
 
-Separate from the hardware "Color Temp" above: each display has its own
-**Presets** section (a `DisclosureGroup` under that display's controls) for
-saving that *one monitor's* current values under a name you choose — e.g. lock
-in a calibration tool's hardware-roughed color as "sRGB calibration 2026-07"
-for that specific display, independent of every other display's presets and of
-the monitor's own hardware Color Temp slot.
+## DDC troubleshooting
 
-Stored in `~/Library/Application Support/DisplayControl/presets.json` as
-`[identityKey: [DisplayPreset]]` — each display keeps its own ordered list.
-Separate file from `SettingsStore`'s last-known-state cache, since presets are
-explicit/user-owned and never auto-applied (unlike `SettingsStore`'s
-restore-on-launch/wake).
+DDC/CI is a fragile hardware control channel. Serialization applies within this
+app, not across processes; concurrent DDC applications can interfere. Firmware,
+adapters, or a wedged controller can still cause failures despite serialization.
 
-Applying a preset goes through the normal `Display.set()` path (`Display.apply(_
-values:)`), so it's also persisted as the new last-known state — e.g. if you
-apply a calibration preset and the Mac later sleeps/wakes, it restores to that
-preset's values, not whatever was set before you picked it.
-
-`PresetStore` takes an optional `directory:` override for the same reason
-`DisplayManager` takes `autoRestore:` — so diagnostics never touch the real
-file. `ddc-diagnose preset-test` exercises the full save → disk → reload →
-apply round trip, scoped to one display, against a temp directory.
-
-**Input source switching (`0x60`) is intentionally not implemented.** All three
-displays this was built against report an unreliable `max` for that opcode (not
-a real contiguous range), and switching a monitor to an input with nothing
-plugged in typically drops it from macOS's online display list until it's
-switched back at the monitor's own controls — not recoverable remotely. Revisit
-only if you have a monitor with multiple active inputs.
-
-## DDC troubleshooting (important)
-
-DDC/CI is a fragile control channel. Two rules keep it healthy:
-
-1. **Only one process should talk to DDC at a time.** Don't run `ddc-diagnose`
-   or the probe while `DisplayControl.app` is running — cross-process concurrent
-   I2C can wedge a monitor's controller.
-2. **A wedged controller needs a power interruption, not a retry.**
-   - Symptom: writes are ACK'd but ignored, or read-backs are wrong/frozen.
-   - A single monitor: power-cycle it (USB-C panels like the XENEON EDGE need a
-     **cable unplug/replug** — the soft power button often doesn't reset DDC).
-   - If display *enumeration itself* hangs (even `ddc-diagnose` produces no
-     output), the Apple-Silicon **DCP is wedged system-wide** → **reboot**.
-
-The app itself serializes all DDC I/O, so in normal use it will not wedge a
-display. The failure modes above come from concurrent access (multiple processes)
-or inherently flaky monitor firmware.
-
-## Phase checklist
-
-- [x] Phase 1 — DDC core (read/write proven on hardware)
-- [x] Phase 0 — Xcode + SwiftPM scaffold
-- [x] Phase 2 — auto-detection (EDID identity, capability probe)
-- [x] Phase 3 — feature model incl. color
-- [x] Phase 4 — menu bar UI (+ serialized/watchdog DDC channel)
-- [x] Phase 5 — persistence + restore on launch/reconnect/wake
-- [x] Phase 6 — polish (launch-at-login, credits/attribution). Input-source
-      switching deliberately skipped — see "Detected VCP features" above.
+If a monitor ignores writes or returns frozen values, try a power interruption.
+USB-C panels may require unplugging/replugging the cable because the soft power
+button may not reset DDC. If display enumeration itself hangs system-wide, a
+reboot may be required to recover Apple's display controller.
 
 ## Credits
 
-DDC engine adapted from MonitorControl (MIT). See `THIRD_PARTY/MonitorControl-LICENSE.txt`.
+IOAVService framing, timing, and IORegistry traversal are adapted from
+[MonitorControl](https://github.com/MonitorControl/MonitorControl) (MIT).
+See `THIRD_PARTY/MonitorControl-LICENSE.txt`.
