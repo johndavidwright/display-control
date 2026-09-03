@@ -43,5 +43,6 @@ jobs:
             "dist/DisplayControl-$version-macOS-arm64.zip" \
             "dist/DisplayControl-$version-macOS-arm64.zip.sha256" \
             "dist/appcast.xml" \
+            LICENSE \
             --verify-tag --title "DisplayControl $version" \
             --notes-file RELEASE_NOTES.md
